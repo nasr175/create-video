@@ -1,0 +1,533 @@
+﻿
+require("dotenv").config();
+
+const express = require("express");
+const crypto = require("crypto");
+const fs = require("fs");
+const { spawn } = require("child_process");
+const { chromium } = require("playwright");
+
+const app = express();
+
+const PORT = 3030;
+const CDP_URL = "http://127.0.0.1:9222";
+
+const CHROME_PATH =
+  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+
+const CHROME_PROFILE =
+  process.env.LOCALAPPDATA
+    ? process.env.LOCALAPPDATA + "\\BeautyWorldFlowChrome"
+    : "";
+
+const FLOW_URL = "https://labs.google/fx/tools/flow";
+
+const TOKEN = process.env.WORKER_TOKEN;
+
+const NEXT_TASK_URL = process.env.N8N_NEXT_TASK_URL;
+const STATUS_URL = process.env.N8N_STATUS_URL;
+
+const POLLING_ENABLED =
+  process.env.WORKER_POLLING_ENABLED === "true";
+
+const DRY_RUN =
+  process.env.DRY_RUN !== "false";
+
+const POLL_INTERVAL_MS =
+  Number(process.env.POLL_INTERVAL_MS || 10000);
+
+const WORKER_ID = "BeautyWorld-Windows";
+
+if (!TOKEN || TOKEN.length < 64) {
+  throw new Error("Worker token is missing or invalid.");
+}
+
+if (!fs.existsSync(CHROME_PATH)) {
+  throw new Error("Google Chrome was not found.");
+}
+
+if (!CHROME_PROFILE) {
+  throw new Error("Chrome profile path is missing.");
+}
+
+if (
+  POLLING_ENABLED &&
+  (!NEXT_TASK_URL || !STATUS_URL)
+) {
+  throw new Error("n8n webhook URLs are missing.");
+}
+
+app.use(express.json({ limit: "100kb" }));
+
+let browser = null;
+let flowPage = null;
+
+let launchInProgress = false;
+let lastLaunchAttempt = 0;
+let watchdogBusy = false;
+let pollBusy = false;
+
+const state = {
+  chrome: "Checking",
+  flow: "Checking",
+  polling: POLLING_ENABLED ? "Enabled" : "Disabled",
+  dryRun: DRY_RUN,
+  lastCheck: null,
+  lastPoll: null,
+  lastTask: null,
+  lastError: null
+};
+
+function log(message) {
+  console.log(
+    "[" + new Date().toLocaleTimeString() + "] " + message
+  );
+}
+
+function authenticate(req, res, next) {
+  const header = req.get("authorization") || "";
+
+  const supplied = header.startsWith("Bearer ")
+    ? header.slice(7)
+    : "";
+
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(TOKEN);
+
+  if (
+    a.length !== b.length ||
+    !crypto.timingSafeEqual(a, b)
+  ) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized"
+    });
+  }
+
+  next();
+}
+
+// --------------------------------------------------
+// Chrome launch
+// --------------------------------------------------
+
+function launchChrome() {
+  const now = Date.now();
+
+  if (
+    launchInProgress ||
+    now - lastLaunchAttempt < 60000
+  ) {
+    return;
+  }
+
+  launchInProgress = true;
+  lastLaunchAttempt = now;
+
+  log("Starting Google Chrome...");
+
+  try {
+    const child = spawn(
+      CHROME_PATH,
+      [
+        "--remote-debugging-port=9222",
+        "--user-data-dir=" + CHROME_PROFILE,
+        "--no-first-run",
+        "--no-default-browser-check",
+        FLOW_URL
+      ],
+      {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: false
+      }
+    );
+
+    child.on("error", error => {
+      state.lastError = error.message;
+      log("Chrome launch error: " + error.message);
+    });
+
+    child.unref();
+
+    log("Chrome launch command sent.");
+
+  } catch (error) {
+    state.lastError = error.message;
+    log("Could not start Chrome: " + error.message);
+  }
+
+  setTimeout(() => {
+    launchInProgress = false;
+  }, 10000);
+}
+
+// --------------------------------------------------
+// Browser connection
+// --------------------------------------------------
+
+async function connectBrowser() {
+  if (browser) {
+    try {
+      const contexts = browser.contexts();
+
+      if (contexts.length > 0) {
+        return browser;
+      }
+    } catch (_) {
+      browser = null;
+    }
+  }
+
+  try {
+    browser = await chromium.connectOverCDP(CDP_URL, {
+      timeout: 5000
+    });
+
+    browser.on("disconnected", () => {
+      log("Chrome connection lost.");
+
+      browser = null;
+      flowPage = null;
+
+      state.chrome = "Disconnected";
+      state.flow = "Unknown";
+    });
+
+    log("Connected to Chrome successfully.");
+
+    return browser;
+
+  } catch (_) {
+    browser = null;
+    state.chrome = "Offline";
+
+    return null;
+  }
+}
+
+async function ensureFlowPage() {
+  const connectedBrowser = await connectBrowser();
+
+  if (!connectedBrowser) {
+    state.chrome = "Offline";
+    state.flow = "Waiting for Chrome";
+
+    launchChrome();
+    return;
+  }
+
+  state.chrome = "Connected";
+
+  const contexts = connectedBrowser.contexts();
+
+  if (!contexts.length) {
+    state.flow = "No browser context";
+    return;
+  }
+
+  const context = contexts[0];
+
+  const pages = context.pages();
+
+  flowPage = pages.find(page => {
+    const url = page.url();
+
+    return (
+      url.includes("flow.google.com") ||
+      url.includes("labs.google/fx/tools/flow")
+    );
+  });
+
+  if (flowPage && !flowPage.isClosed()) {
+    state.flow = "Open";
+    return;
+  }
+
+  log("Google Flow page is missing. Opening it...");
+
+  flowPage = await context.newPage();
+
+  try {
+    await flowPage.goto(FLOW_URL, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000
+    });
+
+    state.flow = "Open";
+
+    log("Google Flow opened successfully.");
+
+  } catch (error) {
+    state.flow = "Navigation error";
+    state.lastError = error.message;
+
+    log("Flow navigation error: " + error.message);
+  }
+}
+
+// --------------------------------------------------
+// Watchdog
+// --------------------------------------------------
+
+async function watchdog() {
+  if (watchdogBusy) return;
+
+  watchdogBusy = true;
+
+  try {
+    state.lastCheck = new Date().toISOString();
+
+    await ensureFlowPage();
+
+  } catch (error) {
+    state.lastError = error.message;
+
+    log("Watchdog error: " + error.message);
+
+  } finally {
+    watchdogBusy = false;
+  }
+}
+
+// --------------------------------------------------
+// n8n communication
+// --------------------------------------------------
+
+async function n8nRequest(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      "X-Worker-Token": TOKEN,
+      ...(options.headers || {})
+    },
+    signal: AbortSignal.timeout(20000)
+  });
+
+  const responseText = await response.text();
+
+  let data;
+
+  try {
+    data = responseText
+      ? JSON.parse(responseText)
+      : {};
+  } catch (_) {
+    throw new Error(
+      "Invalid JSON response from n8n: " +
+      responseText.slice(0, 300)
+    );
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      "n8n HTTP " + response.status + ": " +
+      (data.message || responseText)
+    );
+  }
+
+  return data;
+}
+
+function normalizePayload(payload) {
+  if (typeof payload === "string") {
+    try {
+      return JSON.parse(payload);
+    } catch (_) {
+      throw new Error("Task payload is not valid JSON.");
+    }
+  }
+
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    Array.isArray(payload)
+  ) {
+    throw new Error("Task payload is missing or invalid.");
+  }
+
+  return payload;
+}
+
+async function sendTaskResult(
+  taskId,
+  status,
+  outputPath = "",
+  errorMessage = ""
+) {
+  const result = await n8nRequest(STATUS_URL, {
+    method: "POST",
+    body: JSON.stringify({
+      task_id: taskId,
+      status,
+      worker_id: WORKER_ID,
+      output_path: outputPath,
+      error: errorMessage,
+      message: errorMessage
+    })
+  });
+
+  log(
+    "Task result sent: " +
+    taskId + " => " + status
+  );
+
+  return result;
+}
+
+// --------------------------------------------------
+// Task processing
+// --------------------------------------------------
+
+async function processTask(task) {
+  const taskId = task.task_id;
+
+  if (!taskId) {
+    throw new Error("Task ID is missing.");
+  }
+
+  state.lastTask = taskId;
+
+  log("Received task: " + taskId);
+
+  try {
+    const payload = normalizePayload(task.payload);
+
+    log("Task payload validated.");
+
+    if (DRY_RUN) {
+      log(
+        "DRY RUN: Generation is disabled. " +
+        "No Google Flow generation will be performed."
+      );
+
+      await sendTaskResult(
+        taskId,
+        "completed",
+        "DRY_RUN_VALIDATED_ONLY",
+        "Payload validated only. No video was generated."
+      );
+
+      return;
+    }
+
+    // Safety gate:
+    // Real Google Flow generation is not implemented yet.
+    throw new Error(
+      "Generation is not implemented. " +
+      "DRY_RUN must remain enabled."
+    );
+
+  } catch (error) {
+    log("Task error: " + error.message);
+
+    try {
+      await sendTaskResult(
+        taskId,
+        "failed",
+        "",
+        error.message
+      );
+    } catch (reportError) {
+      log(
+        "Could not report task failure: " +
+        reportError.message
+      );
+    }
+  }
+}
+
+// --------------------------------------------------
+// Queue polling
+// --------------------------------------------------
+
+async function pollQueue() {
+  if (!POLLING_ENABLED || pollBusy) return;
+
+  pollBusy = true;
+  state.lastPoll = new Date().toISOString();
+
+  try {
+    const result = await n8nRequest(
+      NEXT_TASK_URL,
+      {
+        method: "GET"
+      }
+    );
+
+    if (!result.available) {
+      return;
+    }
+
+    if (!result.task_id) {
+      throw new Error(
+        "n8n returned a task without task_id."
+      );
+    }
+
+    log("A queued task was found.");
+
+    await processTask(result);
+
+  } catch (error) {
+    state.lastError = error.message;
+
+    log("Queue polling error: " + error.message);
+
+  } finally {
+    pollBusy = false;
+  }
+}
+
+// --------------------------------------------------
+// Local API
+// --------------------------------------------------
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "OK",
+    service: "BeautyWorld Playwright Worker",
+    worker: WORKER_ID,
+    chrome: state.chrome,
+    flow: state.flow,
+    polling: state.polling,
+    dryRun: state.dryRun,
+    lastCheck: state.lastCheck,
+    lastPoll: state.lastPoll,
+    lastTask: state.lastTask,
+    lastError: state.lastError
+  });
+});
+
+app.post("/test", authenticate, (req, res) => {
+  res.json({
+    success: true,
+    message: "Task received securely",
+    received: req.body,
+    worker: WORKER_ID
+  });
+});
+
+// --------------------------------------------------
+// Start server
+// --------------------------------------------------
+
+app.listen(PORT, "127.0.0.1", () => {
+  log("BeautyWorld Worker Started");
+  log("Local URL: http://127.0.0.1:" + PORT);
+  log("Authentication: ENABLED");
+  log("Browser Watchdog: ENABLED");
+  log("n8n Polling: " + (POLLING_ENABLED ? "ENABLED" : "DISABLED"));
+  log("Dry Run: " + (DRY_RUN ? "ENABLED" : "DISABLED"));
+  log("Paid generation: DISABLED");
+
+  watchdog();
+
+  setInterval(watchdog, 15000);
+
+  if (POLLING_ENABLED) {
+    pollQueue();
+    setInterval(pollQueue, POLL_INTERVAL_MS);
+  }
+});
